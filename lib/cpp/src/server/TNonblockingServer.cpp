@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <assert.h>
 
+
 #ifndef AF_LOCAL
 #define AF_LOCAL AF_UNIX
 #endif
@@ -93,6 +94,7 @@ void TConnection::init(int socket, short eventFlags, TNonblockingServer* s) {
   socket_ = socket;
   server_ = s;
   appState_ = APP_INIT;
+  stop_ = false;
   eventFlags_ = 0;
 
   readBufferPos_ = 0;
@@ -347,6 +349,10 @@ void TConnection::transition() {
       return;
     }
 
+    /// stop if we are supposed to stop
+    if (stopIfNeeded()){
+        return;
+    }
     // In this case, the request was oneway and we should fall through
     // right back into the read frame header state
     goto LABEL_APP_INIT;
@@ -354,6 +360,10 @@ void TConnection::transition() {
   case APP_SEND_RESULT:
 
     ++numWritesSinceReset_;
+    /// stop if we are supposed to stop
+    if (stopIfNeeded()){
+        return;
+    }
 
     // N.B.: We also intentionally fall through here into the INIT state!
 
@@ -397,6 +407,12 @@ void TConnection::transition() {
 
   case APP_READ_FRAME_SIZE:
     // We just read the request length, deserialize it
+
+    /// don't proceed further if a stop is requested
+    if (stopIfNeeded()) {
+        return;
+    }
+
     sz = *(int32_t*)readBuffer_;
     sz = (int32_t)ntohl(sz);
 
@@ -427,6 +443,19 @@ void TConnection::transition() {
     GlobalOutput.printf("Unexpected Application State %d", appState_);
     assert(0);
   }
+}
+
+bool TConnection::stopIfNeeded() {
+    if (gotStop()) {
+        appState_ = APP_CLOSE_CONNECTION;
+        /// just for consistency decrement active
+        /// processors
+        server_->decrementActiveProcessors();
+        close();
+        server_->notifyShutdown(TSHUTDOWN_NOTIFY);
+        return true;
+    }
+    return false;
 }
 
 void TConnection::setFlags(short eventFlags) {
@@ -527,12 +556,16 @@ void TConnection::checkIdleBufferMemLimit(size_t limit) {
  */
 TConnection* TNonblockingServer::createConnection(int socket, short flags) {
   // Check the stack
+  boost::mutex::scoped_lock l(activeConnectionsMutex_);
   if (connectionStack_.empty()) {
-    return new TConnection(socket, flags, this);
+      TConnection* result = new TConnection(socket, flags, this);
+      activeConnections_.push_back(result);
+      return result;
   } else {
     TConnection* result = connectionStack_.top();
     connectionStack_.pop();
     result->init(socket, flags, this);
+    activeConnections_.push_back(result);
     return result;
   }
 }
@@ -543,10 +576,14 @@ TConnection* TNonblockingServer::createConnection(int socket, short flags) {
 void TNonblockingServer::returnConnection(TConnection* connection) {
   if (connectionStackLimit_ &&
       (connectionStack_.size() >= connectionStackLimit_)) {
+    boost::mutex::scoped_lock l(activeConnectionsMutex_);
+    activeConnections_.remove(connection);
     delete connection;
   } else {
     connection->checkIdleBufferMemLimit(idleBufferMemLimit_);
     connectionStack_.push(connection);
+    boost::mutex::scoped_lock l(activeConnectionsMutex_);
+    activeConnections_.remove(connection);
   }
 }
 
@@ -741,6 +778,20 @@ void TNonblockingServer::createNotificationPipe() {
   }
 }
 
+void TNonblockingServer::createShutdownPipe() {
+  if (pipe(shutdownPipeFDs_) != 0) {
+    GlobalOutput.perror("TNonblockingServer::createShutdownPipe ", errno);
+      throw TException("can't create shutdown notification pipe");
+  }
+  int flags;
+  if ((flags = fcntl(shutdownPipeFDs_[0], F_GETFL, 0)) < 0 ||
+      fcntl(shutdownPipeFDs_[0], F_SETFL, flags | O_NONBLOCK) < 0) {
+    close(shutdownPipeFDs_[0]);
+    close(shutdownPipeFDs_[1]);
+    throw TException("TNonblockingServer::createShutdownPipe() O_NONBLOCK");
+  }
+}
+
 /**
  * Register the core libevent events onto the proper base.
  */
@@ -780,6 +831,20 @@ void TNonblockingServer::registerEvents(event_base* base) {
     // Add the event and start up the server
     if (-1 == event_add(&notificationEvent_, 0)) {
       throw TException("TNonblockingServer::serve(): notification event_add fail");
+    }
+
+    event_set(&shutdownEvent_,
+              getShutdownRecvFD(),
+              EV_READ | EV_PERSIST,
+              TNonblockingServer::shutdownHandler,
+              this);
+
+    // Attach to the base
+    event_base_set(eventBase_, &shutdownEvent_);
+
+    // Add the event and start up the server
+    if (-1 == event_add(&shutdownEvent_, 0)) {
+      throw TException("TNonblockingServer::serve(): shutdown event_add fail");
     }
   }
 }
@@ -850,6 +915,7 @@ void TNonblockingServer::serve() {
   if (threadPoolProcessing_) {
     // Init task completion notification pipe
     createNotificationPipe();
+    createShutdownPipe();
   }
 
   // Initialize libevent core
@@ -862,6 +928,76 @@ void TNonblockingServer::serve() {
 
   // Run libevent engine, never returns, invokes calls to eventHandler
   event_base_loop(eventBase_, 0);
+}
+
+void TNonblockingServer::shutdownHandler(int fd, short /* which */, void* data) {
+    TShutdownEvent shut_state;
+    TNonblockingServer* server = (TNonblockingServer*) data;
+    ssize_t nBytes;
+    nBytes = read(fd, (void*)&shut_state, sizeof(TShutdownEvent));
+    if (nBytes != sizeof(TShutdownEvent) && nBytes > 0) {
+        throw TException("TNonblockingServer::shutdownHandler unexpected partial read");
+    } else if (nBytes == -1 && errno != EWOULDBLOCK && errno != EAGAIN) {
+        GlobalOutput.perror("TNonblockingServer::shutdownHandler read failed, resource leak", errno);
+    } else if (shut_state == TSHUTDOWN_INIT) {
+        GlobalOutput.printf("Initializing shutdown...");
+        /// don't accept further incoming connections
+        event se = server->getServerEvent();
+        event_del(&se);
+        ::close(server->getServerSocket());
+        {
+            boost::mutex* mutex_ = server->getActiveConnectionsMutex();
+            boost::mutex::scoped_lock l(*mutex_);
+            std::list<TConnection*> ac = server->getActiveConnections();
+            if (!ac.empty()) {
+                /// notify all active TConnections to stop after sending the results back.
+                for (std::list<TConnection*>::iterator it = ac.begin(); it != ac.end(); it++) {
+                    (*it)->setStop();
+                }
+            }
+        }
+    } else if (shut_state == TSHUTDOWN_NOTIFY) {
+        /// a TConnection notified us that it has shutdown
+        boost::mutex* mutex_ = server->getActiveConnectionsMutex();
+        boost::mutex::scoped_lock l(*mutex_);
+        std::list<apache::thrift::server::TConnection*> ac = server->getActiveConnections();
+        if (ac.empty()) {
+            /// if all TConnection(s) are closed
+            event_base_loopbreak(server->getEventBase());
+        } else {
+            /// idle (just holding on to the connection but not sending data)
+            /// but connected clients may to stop us from exiting, handle it here
+            bool foundNonIdle = false;
+            for (std::list<TConnection*>::iterator it = ac.begin(); it != ac.end(); it++) {
+                /// once signaled with TConnection::setStop() the TConnection(s) in APP_INIT or
+                /// APP_READ_FRAME_SIZE state will right away go to the APP_CLOSE_CONNECTION
+                /// state if they proceed or stay (idle connections) in those states otherwise.
+                /// So, condition below if a safe bet.
+                if ((*it)->getState() > APP_READ_FRAME_SIZE &&
+                        (*it)->getState() < APP_CLOSE_CONNECTION) {
+                    foundNonIdle = true;
+                }
+            }
+            if (!foundNonIdle) {
+                event_base_loopbreak(server->getEventBase());
+            }
+        }
+    }
+}
+
+void TNonblockingServer::notifyShutdown(TShutdownEvent state) {
+    if (write(getShutdownSendFD(), (const void*)&state,
+                sizeof(TShutdownEvent)) != sizeof(TShutdownEvent)) {
+        throw TException("TNonblockingServer::notifyShutdown: failed write on shutdown notification pipe");
+    }
+}
+
+void TNonblockingServer::stop() {
+    /// initialize shutdown
+    notifyShutdown(TSHUTDOWN_INIT);
+    /// let's exit either if no active connections are pending
+    /// or there are only idle connections
+    notifyShutdown(TSHUTDOWN_NOTIFY);
 }
 
 }}} // apache::thrift::server

@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <event.h>
+#include <boost/thread/mutex.hpp>
 
 namespace apache { namespace thrift { namespace server {
 
@@ -58,6 +59,12 @@ enum TOverloadAction {
   T_OVERLOAD_NO_ACTION,        ///< Don't handle overload */
   T_OVERLOAD_CLOSE_ON_ACCEPT,  ///< Drop new connections immediately */
   T_OVERLOAD_DRAIN_TASK_QUEUE  ///< Drop some tasks from head of task queue */
+};
+
+/// Shutdown notification events.
+enum TShutdownEvent {
+    TSHUTDOWN_INIT,
+    TSHUTDOWN_NOTIFY
 };
 
 class TNonblockingServer : public TServer {
@@ -97,6 +104,9 @@ class TNonblockingServer : public TServer {
 
   /// Event struct, used with eventBase_ for task completion notification
   struct event notificationEvent_;
+  
+  /// Event struct, used with eventBase_ for task completion notification
+  struct event shutdownEvent_;
 
   /// Number of TConnection object we've created
   size_t numTConnections_;
@@ -145,6 +155,9 @@ class TNonblockingServer : public TServer {
   /// File descriptors for pipe used for task completion notification.
   int notificationPipeFDs_[2];
 
+  /// File descriptors for pipe used for shutdown notification.
+  int shutdownPipeFDs_[2];
+
   /**
    * This is a stack of all the objects that have been created but that
    * are NOT currently in use. When we close a connection, we place it on this
@@ -152,6 +165,14 @@ class TNonblockingServer : public TServer {
    * memory and reallocating a new object later.
    */
   std::stack<TConnection*> connectionStack_;
+
+  /**
+   * This is a List of active connections, connections which are serving clients
+   * as of right now
+   */
+  std::list<TConnection*> activeConnections_;
+
+  boost::mutex activeConnectionsMutex_;
 
   /**
    * Called when server socket had something happen.  We accept all waiting
@@ -249,6 +270,23 @@ class TNonblockingServer : public TServer {
 
   boost::shared_ptr<ThreadManager> getThreadManager() {
     return threadManager_;
+  }
+
+
+  int getServerSocket() {
+      return serverSocket_;
+  }
+
+  event getServerEvent() {
+      return serverEvent_;
+  }
+
+  std::list<TConnection*> getActiveConnections() {
+      return activeConnections_;
+  }
+
+  boost::mutex* getActiveConnectionsMutex() {
+      return &activeConnectionsMutex_;
   }
 
   /**
@@ -503,6 +541,10 @@ class TNonblockingServer : public TServer {
     ((TNonblockingServer*)v)->handleEvent(fd, which);
   }
 
+  static void shutdownHandler(int, short, void*);
+
+  void notifyShutdown(TShutdownEvent);
+
   /// Creates a socket to listen on and binds it to the local port.
   void listenSocket();
 
@@ -516,6 +558,9 @@ class TNonblockingServer : public TServer {
 
   /// Create the pipe used to notify I/O process of task completion.
   void createNotificationPipe();
+
+  /// Create the pipe used to notify shutdown.
+  void createShutdownPipe();
 
   /**
    * Get notification pipe send descriptor.
@@ -536,6 +581,24 @@ class TNonblockingServer : public TServer {
   }
 
   /**
+   * Get shutdown pipe send descriptor.
+   *
+   * @return write fd for pipe.
+   */
+  int getShutdownSendFD() const {
+    return shutdownPipeFDs_[1];
+  }
+
+  /**
+   * Get shutdown pipe receive descriptor.
+   *
+   * @return read fd of pipe.
+   */
+  int getShutdownRecvFD() const {
+    return shutdownPipeFDs_[0];
+  }
+
+  /**
    * Register the core libevent events onto the proper base.
    *
    * @param base pointer to the event base to be initialized.
@@ -547,6 +610,8 @@ class TNonblockingServer : public TServer {
    * loops over the libevent handler.
    */
   void serve();
+
+  void stop();
 };
 
 /// Two states for sockets, recv and send mode
@@ -649,6 +714,9 @@ class TConnection {
   /// Protocol encoder
   boost::shared_ptr<TProtocol> outputProtocol_;
 
+  /// stop Flag
+  bool stop_;
+
   /// Go into read mode
   void setRead() {
     setFlags(EV_READ | EV_PERSIST);
@@ -721,6 +789,17 @@ class TConnection {
 
   /// Initialize
   void init(int socket, short eventFlags, TNonblockingServer *s);
+
+  bool stopIfNeeded();
+
+  void setStop() {
+      stop_ = true;
+  }
+
+  bool gotStop() {
+      return stop_;
+  }
+
 
   /**
    * This is called when the application transitions from one state into
