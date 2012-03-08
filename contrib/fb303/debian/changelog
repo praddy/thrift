@@ -1,0 +1,5 @@
+libfb303 (0.4.0-1) unstable; urgency=low
+
+  * Initial release (Closes: #nnnn)  <nnnn is the bug number of your ITP>
+
+ -- Pradeep Jindal <praddy@unknown>  Tue, 06 Mar 2012 19:40:35 +0530
